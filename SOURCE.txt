@@ -1,0 +1,4 @@
+source: https://github.com/mapbox/earcut
+commit: 934e54d8bed85387330b7acaa5d2f5ba30a460a3
+license: ISC
+imported: 2026-11-15
