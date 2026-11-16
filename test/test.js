@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Worker} from 'node:worker_threads';
-import earcut, {flatten, deviation, refine} from '../src/earcut.js';
+import earcut, {flatten, deviation, refine, repair, validateTriangles} from '../src/earcut.js';
 import fs from 'fs';
 import expected from './expected.json' with {type: 'json'};
 import {readTilesFixture} from '../bench/tiles-fixture.js';
@@ -366,5 +366,259 @@ test('block-index-collinear', () => {
         const indices = earcut(data.vertices, data.holes, data.dimensions);
         const err = deviation(data.vertices, data.holes, data.dimensions, indices);
         assert.ok(err < 1e-9, `rotation ${rotation}: deviation ${err} (hole dropped?)`);
+    }
+});
+
+// ─── repair(): dirty-input cleaning and validation ─────────────────────────────────────────────
+
+// triangulate every polygon repair() emits and validate the resulting index buffer end to end
+function repairAndTriangulate(data, holes, dim = 2, options) {
+    const repaired = repair(data, holes, dim, options);
+    const triangulated = repaired.polygons.map((polygon) => {
+        const raw = earcut(polygon.vertices, polygon.holes, polygon.dimensions);
+        const checked = validateTriangles(raw, polygon.vertices, polygon.dimensions);
+        assert.deepEqual(checked.errors, []);
+        assert.equal(
+            deviation(polygon.vertices, polygon.holes, polygon.dimensions, checked.triangles), 0);
+        return {polygon, triangles: checked.triangles};
+    });
+    return {...repaired, triangulated};
+}
+
+test('repair removes duplicate, collinear and repeated closing points', () => {
+    // square with a doubled vertex, a collinear midpoint and a repeated first point at the end
+    const data = [0, 0, 0, 0, 5, 0, 10, 0, 10, 10, 0, 10, 0, 0];
+    const result = repairAndTriangulate(data);
+
+    assert.equal(result.stats.removedClosing, 1);
+    assert.equal(result.stats.removedDuplicates, 1);
+    assert.equal(result.stats.removedCollinear, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.polygons.length, 1);
+    assert.equal(result.polygons[0].vertices.length, 8); // the four distinct square corners
+    assert.equal(result.triangulated[0].triangles.length, 6); // one square → two triangles
+});
+
+test('repair rejects a degenerate ring instead of triangulating it', () => {
+    const line = repair([0, 0, 5, 0, 10, 0]);
+    assert.equal(line.polygons.length, 0);
+    assert.equal(line.errors[0].code, 'degenerate-ring');
+
+    const twoPoints = repair([0, 0, 0, 0, 1, 1]);
+    assert.equal(twoPoints.polygons.length, 0);
+    assert.equal(twoPoints.stats.droppedRings, 1);
+
+    assert.deepEqual(repair([]), {polygons: [], errors: [], stats: {
+        removedDuplicates: 0, removedCollinear: 0, removedClosing: 0, splitRings: 0, droppedRings: 0}});
+});
+
+test('repair rejects a self-intersecting ring by default and never emits triangles for it', () => {
+    // bowtie: plain earcut() silently returns a triangle with infinite deviation
+    const bowtie = [0, 0, 10, 0, 0, 10, 10, 10];
+    const result = repair(bowtie);
+
+    assert.equal(result.polygons.length, 0);
+    assert.equal(result.errors[0].code, 'self-intersection');
+    assert.equal(result.errors[0].ring, 0);
+    assert.equal(repair(bowtie, null, 2, {selfIntersect: 'error'}).polygons.length, 0);
+});
+
+test('repair splits a self-intersecting ring into simple rings when asked', () => {
+    const bowtie = [0, 0, 10, 0, 0, 10, 10, 10];
+    const result = repairAndTriangulate(bowtie, null, 2, {selfIntersect: 'split'});
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.polygons.length, 2);
+    assert.ok(result.stats.splitRings >= 1);
+    // each lobe is a triangle, and both share the synthetic crossing vertex
+    const total = result.triangulated.reduce((sum, t) => sum + t.triangles.length / 3, 0);
+    assert.equal(total, 2);
+    assert.deepEqual(result.polygons.map(p => p.sourceRings), [[0], [0]]);
+});
+
+test('repair splits a figure-eight ring meeting at a shared vertex', () => {
+    // two squares touching at (0,0), which appears twice in the ring order
+    const figureEight = [0, 0, 10, 0, 10, 10, 0, 10, 0, 0, -10, 0, -10, -10, 0, -10];
+    const result = repairAndTriangulate(figureEight, null, 2, {selfIntersect: 'split'});
+
+    assert.equal(result.polygons.length, 2);
+    const total = result.triangulated.reduce((sum, t) => sum + t.triangles.length / 3, 0);
+    assert.equal(total, 4); // two quads, two triangles each
+});
+
+test('repair reports collinear edge overlap as unsplittable even in split mode', () => {
+    // edge (0,0)-(10,0) overlaps the disjoint edge (6,0)-(4,0): no unambiguous split exists
+    const data = [0, 0, 10, 0, 10, 10, 6, 0, 4, 0, 4, -5, 6, -5];
+    const result = repair(data, null, 2, {selfIntersect: 'split'});
+
+    assert.ok(result.errors.some(e => e.code === 'self-intersection'));
+});
+
+test('repair rejects a hole declared outside the outer ring instead of silently dropping it', () => {
+    // square outer ring plus a square hole sitting entirely outside it
+    const data = [0, 0, 10, 0, 10, 10, 0, 10, 20, 20, 30, 20, 30, 30, 20, 30];
+    const result = repairAndTriangulate(data, [4]);
+
+    assert.ok(result.errors.some(e => e.code === 'hole-outside' && e.ring === 1));
+    assert.equal(result.polygons.length, 1);
+    assert.deepEqual(result.polygons[0].holes, []); // bad hole removed, outer ring still triangulated
+});
+
+test('repair keeps a normal hole as a hole', () => {
+    const data = [0, 0, 100, 0, 100, 100, 0, 100, 20, 20, 80, 20, 80, 80, 20, 80];
+    const result = repairAndTriangulate(data, [4]);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.polygons.length, 1);
+    assert.deepEqual(result.polygons[0].holes, [4]);
+});
+
+test('repair turns a nested island into its own polygon so the hole cannot cover the outer ring', () => {
+    // outer square (400), hole ring (256), island ring inside the hole (100)
+    const data = [
+        0, 0, 20, 0, 20, 20, 0, 20,
+        2, 2, 18, 2, 18, 18, 2, 18,
+        5, 5, 15, 5, 15, 15, 5, 15];
+    const result = repairAndTriangulate(data, [4, 8]);
+
+    assert.ok(result.errors.some(e => e.code === 'nested-ring' && e.ring === 2));
+    assert.equal(result.polygons.length, 2);
+
+    const outer = result.polygons.find(p => p.sourceRings.includes(0));
+    const island = result.polygons.find(p => p.sourceRings.includes(2));
+    assert.equal(outer.holes.length, 1);
+    assert.deepEqual(island.holes, []);
+
+    // filled area = outer − hole + island = 400 − 256 + 100 = 244, matching every emitted triangle
+    let area = 0;
+    for (const group of result.triangulated) {
+        const v = group.polygon.vertices, d = group.polygon.dimensions;
+        for (let k = 0; k < group.triangles.length; k += 3) {
+            const a = group.triangles[k] * d, b = group.triangles[k + 1] * d, c = group.triangles[k + 2] * d;
+            area += Math.abs((v[a] - v[c]) * (v[b + 1] - v[a + 1]) -
+                (v[a] - v[b]) * (v[c + 1] - v[a + 1])) / 2;
+        }
+    }
+    assert.ok(Math.abs(area - 244) < 1e-9, `filled area ${area} !== 244`);
+});
+
+test('repair rejects a hole whose boundary crosses the outer ring instead of mistriangulating it', () => {
+    // the hole rectangle straddles the outer square's left edge; plain earcut() gives a
+    // nonzero deviation here, repair() must drop the hole and keep the outer ring intact
+    const outer = [0, 0, 10, 0, 10, 10, 0, 10];
+    const crossingHole = [-2, 4, 4, 4, 4, 6, -2, 6];
+    const result = repairAndTriangulate([...outer, ...crossingHole], [4]);
+
+    assert.ok(result.errors.some(e => e.code === 'overlapping-rings' && e.ring === 1));
+    assert.equal(result.polygons.length, 1);
+    assert.deepEqual(result.polygons[0].holes, []);
+});
+
+test('repair rejects near-zero-area sliver rings that would yield zero-area triangles', () => {
+    // triangle area = 5e-15, below the roundoff-scaled epsilon but not exactly zero
+    const result = repair([0, 0, 10, 0, 5, 1e-15]);
+    assert.equal(result.polygons.length, 0);
+    assert.equal(result.errors[0].code, 'degenerate-ring');
+});
+
+test('every ring emitted by repair in split mode is simple and triangulates with zero deviation', () => {
+    // figure-eight whose split lobes must never be mis-grouped as a shell and its hole
+    const bowtie = [0, 0, 10, 10, 0, 10, 10, 0];
+    const result = repairAndTriangulate(bowtie, null, 2, {selfIntersect: 'split'});
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.polygons.length, 2);
+    for (const polygon of result.polygons) assert.deepEqual(polygon.holes, []);
+});
+
+test('repair reports each problem source ring once even when it splits into several rings', () => {
+    // a self-intersecting hole that fans out into lobes outside the outer ring: hole-outside must
+    // be reported for ring 1 once, not once per emitted lobe
+    const outer = [0, 0, 10, 0, 10, 10, 0, 10];
+    const badHole = [50, 50, 60, 60, 50, 60, 60, 50]; // bowtie shape well outside the outer ring
+    const result = repair([...outer, ...badHole], [4], 2, {selfIntersect: 'split'});
+
+    const outside = result.errors.filter(e => e.code === 'hole-outside' && e.ring === 1);
+    assert.equal(outside.length, 1);
+});
+
+test('repair preserves extra dimensions for 3D input', () => {
+    const data = [0, 0, 9, 0, 0, 9, 10, 0, 9, 10, 10, 9, 0, 10, 9, 0, 0, 9];
+    const result = repairAndTriangulate(data, null, 3);
+
+    assert.equal(result.polygons[0].dimensions, 3);
+    assert.equal(result.polygons[0].vertices.length, 12);
+    assert.equal(result.stats.removedClosing, 1);
+});
+
+test('repair throws on structural misuse but never on geometric defects', () => {
+    assert.throws(() => repair([0, 0, 1, 1, 2, 2], [10]), RangeError);
+    assert.throws(() => repair([0, 0, 1], null, 2), RangeError); // trailing partial vertex
+    assert.throws(() => repair([0, 0, 1, 1, 2, 2], [1, 1]), RangeError); // non-increasing holes
+    assert.throws(() => repair([0, 0, 1, 1], null, 1), RangeError); // dim < 2
+    assert.throws(() => validateTriangles([], [0, 0, 1], 2), RangeError); // partial vertex in data
+    // geometrically empty input is not misuse; an explicit null options object is accepted
+    assert.doesNotThrow(() => repair([]));
+    assert.doesNotThrow(() => repair([0, 0, 10, 0, 10, 10], null, 2, null));
+});
+
+test('repair is also available as earcut.repair and leaves the default export signature intact', () => {
+    assert.equal(earcut.repair, repair);
+    assert.deepEqual(earcut([10, 0, 0, 50, 60, 60, 70, 10]), [1, 0, 3, 1, 3, 2]);
+});
+
+test('validateTriangles drops degenerate and out-of-range triangles without mutating input', () => {
+    const vertices = [0, 0, 10, 0, 10, 10, 0, 10];
+    // good, good, zero-area (0,0,1 collinear with... actually two equal indices), out-of-range
+    const raw = [0, 1, 2, 0, 2, 3, 0, 0, 1, 0, 3, 99];
+    const snapshot = raw.slice();
+    const result = validateTriangles(raw, vertices);
+
+    assert.equal(result.triangles.length, 6); // the two valid triangles survive
+    assert.equal(result.stats.droppedDegenerate, 1);
+    assert.equal(result.stats.droppedInvalid, 1);
+    assert.equal(result.errors.length, 1);
+    assert.deepEqual(raw, snapshot); // input buffer untouched
+});
+
+test('validateTriangles flags a buffer whose length is not a multiple of three', () => {
+    const result = validateTriangles([0, 1, 2, 0], [0, 0, 10, 0, 10, 10]);
+    assert.equal(result.triangles.length, 3);
+    assert.equal(result.errors.length, 1);
+});
+
+test('repaired fixture polygons triangulate with valid indices and zero deviation under rotation', () => {
+    // dirty variant of a standard polygon: closing point, a duplicate and a collinear insertion
+    const coords = JSON.parse(fs.readFileSync(new URL('fixtures/earcut.json', import.meta.url)));
+    const dirty = coords.map((ring) => {
+        const copy = ring.map(p => p.slice());
+        copy.splice(1, 0, copy[0].slice());            // duplicate of the first point
+        copy.splice(2, 0, [(copy[0][0] + copy[1][0]) / 2, (copy[0][1] + copy[1][1]) / 2]); // collinear
+        copy.push(copy[0].slice());                     // repeated closing point
+        return copy;
+    });
+    const flat = flatten(dirty);
+
+    for (const rotation of [0, 90, 180, 270]) {
+        const theta = rotation * Math.PI / 180;
+        const xx = Math.round(Math.cos(theta)), xy = Math.round(-Math.sin(theta));
+        const yx = Math.round(Math.sin(theta)), yy = Math.round(Math.cos(theta));
+        const vertices = flat.vertices.slice();
+        for (let i = 0; i < vertices.length; i += 2) {
+            const x = vertices[i], y = vertices[i + 1];
+            vertices[i] = xx * x + xy * y;
+            vertices[i + 1] = yx * x + yy * y;
+        }
+
+        const repaired = repair(vertices, flat.holes, flat.dimensions);
+        assert.deepEqual(repaired.errors, []);
+        for (const polygon of repaired.polygons) {
+            const checked = validateTriangles(
+                earcut(polygon.vertices, polygon.holes, polygon.dimensions),
+                polygon.vertices, polygon.dimensions);
+            assert.deepEqual(checked.errors, []);
+            assert.equal(
+                deviation(polygon.vertices, polygon.holes, polygon.dimensions, checked.triangles), 0);
+        }
     }
 });

@@ -1053,3 +1053,749 @@ function ensureScratch(n) {
     if (!hTable || hTable.length < size) { hTable = new Int32Array(size); hStamp = new Uint32Array(size); }
     hMask = size - 1;
 }
+
+// ─── dirty-input repair layer ──────────────────────────────────────────────────────────────────
+//
+// earcut() assumes a valid polygon (see the "Robustness" section of the README) and on dirty data
+// can silently emit overlapping or out-of-polygon triangles, loop forever, or throw. The functions
+// below form an explicit pre/post layer instead: repair() turns a flat dirty polygon into a list of
+// clean simple polygons that are safe to feed earcut(), reporting every problem it found rather
+// than papering over it; validateTriangles() checks an index buffer before it reaches the GPU.
+// Nothing here is on the earcut() hot path — the main function keeps its signature and behavior.
+
+/**
+ * What repair() should do with a self-intersecting ring:
+ * - `'error'` (default): reject the ring, record an error and emit no triangles for it;
+ * - `'split'`: cut the ring at each crossing into simple rings (figure-eight → two lobes);
+ *   overlaps that cannot be split unambiguously are still rejected with an error.
+ * @typedef {'split' | 'error'} SelfIntersectStrategy
+ */
+
+/**
+ * @typedef {'duplicate-point' | 'collinear-point' | 'closing-point' | 'degenerate-ring' | 'self-intersection' | 'hole-outside' | 'nested-ring' | 'overlapping-rings'} RepairErrorCode
+ */
+
+/**
+ * @typedef {object} RepairError
+ * @property {RepairErrorCode} code machine-readable error code
+ * @property {number} [ring] index of the offending input ring (0 = outer ring), when applicable
+ * @property {string} message human-readable explanation
+ */
+
+/**
+ * A clean simple polygon ready for earcut(): a flat vertex array plus the start indices of its
+ * hole rings, in exactly the shape earcut() takes. `sourceRings` maps each emitted ring back to
+ * the input ring it was derived from (a split ring fans out into several emitted rings sharing one
+ * source index).
+ * @typedef {object} RepairedPolygon
+ * @property {number[]} vertices flat coordinate array, `dimensions` values per vertex
+ * @property {number[]} holes hole ring start indices, in vertices
+ * @property {number} dimensions coordinates per vertex
+ * @property {number[]} sourceRings input-ring index of each emitted ring
+ */
+
+/**
+ * @typedef {object} RepairStats
+ * @property {number} removedDuplicates coincident points collapsed onto their neighbor
+ * @property {number} removedCollinear collinear middle points removed
+ * @property {number} removedClosing repeated first/last closing points removed
+ * @property {number} splitRings rings cut into simple rings at self-intersections
+ * @property {number} droppedRings rings rejected as untriangulable
+ */
+
+/**
+ * @typedef {object} RepairResult
+ * @property {RepairedPolygon[]} polygons clean simple polygons; triangulate each with earcut()
+ * @property {RepairError[]} errors every problem found, in the order it was detected
+ * @property {RepairStats} stats counts of what the repair pass did
+ */
+
+/**
+ * Clean and validate a dirty polygon before triangulation.
+ *
+ * The cleaning pass, per ring, removes repeated closing points, consecutive duplicate points and
+ * collinear middle points. Self-intersecting rings are either split into simple rings or rejected
+ * outright, depending on `options.selfIntersect`. Holes are then checked against the outer ring
+ * and arranged into a containment hierarchy: a ring nested in a hole (an island) becomes its own
+ * output polygon, so a hole can never cover the outer ring, and a declared hole found outside the
+ * outer ring is rejected with a `hole-outside` error instead of being silently dropped.
+ *
+ * Never throws on geometric problems — they land in `errors` and the offending geometry is excluded
+ * from `polygons`, so the caller decides what to do. Structural misuse (bad `dim`, malformed
+ * `holeIndices`) still throws, since no repair policy can interpret it.
+ *
+ * @param {ArrayLike<number>} data flat array of vertex coordinates, as taken by earcut()
+ * @param {ArrayLike<number> | null} [holeIndices] indices (in vertices) where each hole ring starts
+ * @param {number} [dim=2] number of coordinates per vertex in `data`
+ * @param {{selfIntersect?: SelfIntersectStrategy}} [options]
+ * @returns {RepairResult}
+ * @example
+ * const {polygons, errors} = earcut.repair(data, holes, 2);
+ * const triangles = polygons.flatMap(p => earcut(p.vertices, p.holes, p.dimensions));
+ */
+export function repair(data, holeIndices = null, dim = 2, options) {
+    const strategy = options && options.selfIntersect === 'split' ? 'split' : 'error';
+
+    if (!Number.isInteger(dim) || dim < 2) {
+        throw new RangeError(`earcut.repair: dim must be an integer >= 2, got ${dim}`);
+    }
+    if (data.length % dim !== 0) {
+        throw new RangeError('earcut.repair: data length is not a multiple of dim (trailing partial vertex)');
+    }
+    const vertexCount = data.length / dim;
+
+    /** @type {RepairError[]} */
+    const errors = [];
+    /** @type {RepairStats} */
+    const stats = {
+        removedDuplicates: 0,
+        removedCollinear: 0,
+        removedClosing: 0,
+        splitRings: 0,
+        droppedRings: 0
+    };
+
+    // split the flat input into per-ring vertex ranges; hole indices must be strictly increasing
+    // and point inside the array — a bogus index is a caller bug, not a geometric defect
+    /** @type {Array<[number, number]>} */
+    const ranges = [[0, holeIndices && holeIndices.length ? holeIndices[0] : vertexCount]];
+    if (holeIndices) {
+        for (let i = 0; i < holeIndices.length; i++) {
+            const h = holeIndices[i];
+            if (!Number.isInteger(h) || h <= 0 || h >= vertexCount) {
+                throw new RangeError(`earcut.repair: hole index ${h} out of range [1, ${vertexCount - 1}]`);
+            }
+            if (i > 0 && h <= holeIndices[i - 1]) {
+                throw new RangeError(`earcut.repair: hole indices must be strictly increasing (${holeIndices[i - 1]} >= ${h})`);
+            }
+            const end = i < holeIndices.length - 1 ? holeIndices[i + 1] : vertexCount;
+            ranges.push([h, end]);
+        }
+    }
+
+    // coordinate pool: original vertices keep their index; split crossings append synthetic ones
+    if (vertexCount === 0) return {polygons: [], errors, stats};
+    /** @type {number[][]} */
+    const pool = new Array(vertexCount);
+    for (let v = 0; v < vertexCount; v++) {
+        const p = new Array(dim);
+        for (let d = 0; d < dim; d++) p[d] = data[v * dim + d];
+        pool[v] = p;
+    }
+    /** @param {number} a @param {number} b @returns {boolean} */
+    const samePoint = (a, b) => {
+        const pa = pool[a], pb = pool[b];
+        for (let d = 0; d < dim; d++) if (pa[d] !== pb[d]) return false;
+        return true;
+    };
+    /** @param {number} a @param {number} b @param {number} c @returns {number} */
+    const orient3 = (a, b, c) => {
+        const pa = pool[a], pb = pool[b], pc = pool[c];
+        return (pb[0] - pa[0]) * (pc[1] - pb[1]) - (pb[1] - pa[1]) * (pc[0] - pb[0]);
+    };
+    /** @param {number} a @param {number} b @param {number} t @returns {number} */
+    const lerpPoint = (a, b, t) => {
+        const pa = pool[a], pb = pool[b], p = new Array(dim);
+        for (let d = 0; d < dim; d++) p[d] = pa[d] + (pb[d] - pa[d]) * t;
+        pool.push(p);
+        return pool.length - 1;
+    };
+
+    /**
+     * @typedef {object} CleanRing
+     * @property {number[]} ids pool vertex ids in ring order, no repeated closing point
+     * @property {number} source input-ring index this ring derives from
+     * @property {number} area signed (shoelace) area, filled in after splitting is done
+     * @property {CleanRing | null} parent containing ring in the containment hierarchy
+     * @property {number} depth 0 for outer-level shells, 1 for holes, 2 for islands, ...
+     */
+
+    /** @type {CleanRing[]} */
+    const rings = [];
+
+    // remove closing/duplicate/collinear points from a ring id list. Consecutive duplicates are
+    // collapsed in a linear sweep first, because a duplicated vertex makes the orientation test
+    // read 0 and would otherwise be miscounted (and mis-handled) as collinear; the collinear sweep
+    // then loops to a fixpoint since each removal can make a previously non-collinear pair collinear.
+    /** @param {number[]} ids @param {number} source @returns {number[] | null} */
+    function cleanRing(ids, source) {
+        if (ids.length >= 2 && samePoint(ids[ids.length - 1], ids[0])) {
+            ids.pop();
+            stats.removedClosing++;
+        }
+
+        // linear dedup of consecutive coincident vertices, keeping the first of each run
+        if (ids.length >= 2) {
+            /** @type {number[]} */
+            const deduped = [ids[0]];
+            for (let k = 1; k < ids.length; k++) {
+                if (samePoint(ids[k], deduped[deduped.length - 1])) {
+                    stats.removedDuplicates++;
+                } else {
+                    deduped.push(ids[k]);
+                }
+            }
+            ids = deduped;
+        }
+
+        let changed = true;
+        while (changed && ids.length >= 3) {
+            changed = false;
+            /** @type {number[]} */
+            const out = [];
+            for (let k = 0; k < ids.length; k++) {
+                const prev = ids[(k + ids.length - 1) % ids.length];
+                const cur = ids[k];
+                const next = ids[(k + 1) % ids.length];
+                if (!samePoint(prev, cur) && !samePoint(cur, next) && orient3(prev, cur, next) === 0) {
+                    stats.removedCollinear++;
+                    changed = true;
+                } else {
+                    out.push(cur);
+                }
+            }
+            ids = out;
+        }
+        if (ids.length < 3) {
+            errors.push({
+                code: 'degenerate-ring',
+                ring: source,
+                message: `ring ${source} collapsed to fewer than 3 distinct points and cannot be triangulated`
+            });
+            stats.droppedRings++;
+            return null;
+        }
+        return ids;
+    }
+
+    // find the first self-intersection of a simple-ordered id list. Proper crossings and
+    // T-junctions are splittable; collinear overlaps are ambiguous and reported as unsplittable,
+    // so they get a dedicated first pass — otherwise an earlier T-junction on the same ring could
+    // be cut away before the overlapping pair is ever inspected.
+    /**
+     * @param {number[]} ids
+     * @returns {{kind: 'proper' | 'touch' | 'duplicate' | 'collinear', i: number, j: number, id: number} | null}
+     */
+    function findSelfIntersection(ids) {
+        const n = ids.length;
+
+        // non-adjacent repeated vertex: split at the shared point, no synthetic vertex needed
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 2; j < n; j++) {
+                if ((i !== 0 || j !== n - 1) && samePoint(ids[i], ids[j])) {
+                    return {kind: 'duplicate', i, j, id: ids[i]};
+                }
+            }
+        }
+
+        // pass 1: collinear edge pairs whose segments overlap (and which don't merely meet at a
+        // shared endpoint) — an overlap has no unambiguous simple-ring decomposition
+        for (let i = 0; i < n; i++) {
+            const a = ids[i], b = ids[(i + 1) % n];
+            for (let j = i + 2; j < n; j++) {
+                if (i === 0 && j === n - 1) continue; // adjacent edges in the circular ordering
+                const c = ids[j], d = ids[(j + 1) % n];
+                if (orient3(a, b, c) === 0 && orient3(a, b, d) === 0 &&
+                        bboxesOverlap(a, b, c, d) &&
+                        !samePoint(a, c) && !samePoint(a, d) && !samePoint(b, c) && !samePoint(b, d)) {
+                    return {kind: 'collinear', i, j, id: -1};
+                }
+            }
+        }
+
+        // pass 2: proper crossings and T-junctions
+        for (let i = 0; i < n; i++) {
+            const a = ids[i], b = ids[(i + 1) % n];
+            for (let j = i + 2; j < n; j++) {
+                if (i === 0 && j === n - 1) continue; // edges share vertex a: adjacent in the circle
+                const c = ids[j], d = ids[(j + 1) % n];
+                const d1 = orient3(c, d, a), d2 = orient3(c, d, b);
+                const d3 = orient3(a, b, c), d4 = orient3(a, b, d);
+                const crosses = ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+                    ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+
+                if (crosses) {
+                    // A + t(B - A) where orient(A,B,P(t)) = d3 + t(d4 - d3) = 0
+                    const t = d3 / (d3 - d4);
+                    return {kind: 'proper', i, j, id: lerpPoint(a, b, t)};
+                }
+
+                // T-junction: a vertex of one edge lies strictly inside the other edge
+                if (d3 === 0 && onSegmentPool(a, b, c)) return {kind: 'touch', i, j, id: c};
+                if (d4 === 0 && onSegmentPool(a, b, d)) return {kind: 'touch', i, j, id: d};
+                if (d1 === 0 && onSegmentPool(c, d, a)) return {kind: 'touch', i: j, j: i, id: a};
+                if (d2 === 0 && onSegmentPool(c, d, b)) return {kind: 'touch', i: j, j: i, id: b};
+            }
+        }
+        return null;
+    }
+
+    /** @param {number} p @param {number} q @param {number} r @returns {boolean} */
+    function onSegmentPool(p, q, r) {
+        const pp = pool[p], qp = pool[q], rp = pool[r];
+        return rp[0] <= Math.max(pp[0], qp[0]) && rp[0] >= Math.min(pp[0], qp[0]) &&
+            rp[1] <= Math.max(pp[1], qp[1]) && rp[1] >= Math.min(pp[1], qp[1]);
+    }
+    /** @param {number} a @param {number} b @param {number} c @param {number} d @returns {boolean} */
+    function bboxesOverlap(a, b, c, d) {
+        const pa = pool[a], pb = pool[b], pc = pool[c], pd = pool[d];
+        return Math.max(pa[0], pb[0]) >= Math.min(pc[0], pd[0]) &&
+            Math.min(pa[0], pb[0]) <= Math.max(pc[0], pd[0]) &&
+            Math.max(pa[1], pb[1]) >= Math.min(pc[1], pd[1]) &&
+            Math.min(pa[1], pb[1]) <= Math.max(pc[1], pd[1]);
+    }
+
+    // recursively split-or-reject one cleaned ring. `budget` bounds the recursion: every split
+    // strictly shortens both children, so more cuts than original vertices means the ring never
+    // converges (defensive — the splittable cases always shrink on the first cut).
+    /** @param {number[]} ids @param {number} source @param {number} budget */
+    function resolveRing(ids, source, budget) {
+        const hit = findSelfIntersection(ids);
+        if (!hit) {
+            rings.push({ids, source, area: 0, parent: null, depth: -1});
+            return;
+        }
+
+        if (hit.kind === 'collinear' || strategy === 'error' || budget <= 0) {
+            /** @type {string} */
+            let message;
+            if (hit.kind === 'collinear') {
+                message = `ring ${source} has overlapping collinear edges, which cannot be split unambiguously`;
+            } else if (strategy === 'error') {
+                message = `ring ${source} is self-intersecting; pass {selfIntersect: 'split'} to split it into simple rings`;
+            } else {
+                message = `ring ${source} did not converge after splitting and was rejected`;
+            }
+            errors.push({code: 'self-intersection', ring: source, message});
+            stats.droppedRings++;
+            return;
+        }
+
+        stats.splitRings++;
+        const {i, j, id} = hit;
+        const n = ids.length;
+        // cut at the crossing: lobe 1 runs i+1..j, lobe 2 wraps j+1..i; each opens and closes
+        // through the shared crossing point, which cleanRing() immediately collapses
+        const child1 = cleanRing([id, ...ids.slice(i + 1, j + 1)], source);
+        const child2 = cleanRing([id, ...ids.slice(j + 1), ...ids.slice(0, i + 1)], source);
+        if (!child1 || !child2 || child1.length >= n || child2.length >= n) {
+            errors.push({
+                code: 'self-intersection',
+                ring: source,
+                message: `ring ${source} produced a non-simple split and was rejected`
+            });
+            stats.droppedRings++;
+            return;
+        }
+        resolveRing(child1, source, budget - 1);
+        resolveRing(child2, source, budget - 1);
+    }
+
+    for (let r = 0; r < ranges.length; r++) {
+        const [start, end] = ranges[r];
+        const ids = [];
+        for (let v = start; v < end; v++) ids.push(v);
+        const cleaned = cleanRing(ids, r);
+        if (cleaned) resolveRing(cleaned, r, cleaned.length);
+    }
+
+    if (rings.length === 0) return {polygons: [], errors, stats};
+
+    // area below which a ring is treated as degenerate. Splitting at a crossing can leave a
+    // sliver lobe whose points are nearly coincident; its absolute shoelace area is non-zero but
+    // below the float roundoff of the coordinate magnitude, and feeding it to earcut yields
+    // zero-area triangles. The threshold mirrors deviation(): O(n) edges, each O(max²) in area.
+    let maxCoord = 0;
+    for (const p of pool) {
+        maxCoord = Math.max(maxCoord, Math.abs(p[0]), Math.abs(p[1]));
+    }
+    const areaEpsilon = pool.length * maxCoord * maxCoord * Number.EPSILON;
+
+    // signed shoelace area; reject zero-area and sub-epsilon survivors (collinear-after-split lobes)
+    for (const ring of rings) {
+        let sum = 0;
+        for (let k = 0, n = ring.ids.length; k < n; k++) {
+            const p = pool[ring.ids[k]], q = pool[ring.ids[(k + 1) % n]];
+            sum += p[0] * q[1] - q[0] * p[1];
+        }
+        ring.area = sum / 2;
+        if (Math.abs(ring.area) <= areaEpsilon) {
+            errors.push({
+                code: 'degenerate-ring',
+                ring: ring.source,
+                message: `ring ${ring.source} has ${ring.area === 0 ? 'zero' : 'near-zero'} area and cannot be triangulated`
+            });
+        }
+    }
+    for (let k = rings.length - 1; k >= 0; k--) {
+        if (Math.abs(rings[k].area) <= areaEpsilon) { rings.splice(k, 1); stats.droppedRings++; }
+    }
+    if (rings.length === 0) return {polygons: [], errors, stats};
+
+    // reject ring pairs that cross or share an edge segment: rings may meet at vertices (the lobes
+    // of a split ring do), but overlapping boundaries make a containment hierarchy meaningless
+    /** @param {CleanRing} a @param {CleanRing} b @returns {boolean} */
+    function ringsOverlap(a, b) {
+        const ai = a.ids, bi = b.ids;
+        for (let i = 0; i < ai.length; i++) {
+            const p = ai[i], q = ai[(i + 1) % ai.length];
+            for (let j = 0; j < bi.length; j++) {
+                const r = bi[j], s = bi[(j + 1) % bi.length];
+                if (samePoint(p, r) || samePoint(p, s) || samePoint(q, r) || samePoint(q, s)) continue;
+                const d1 = orient3(r, s, p), d2 = orient3(r, s, q);
+                const d3 = orient3(p, q, r), d4 = orient3(p, q, s);
+                if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+                    ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+                if (d1 === 0 && d2 === 0 && d3 === 0 && d4 === 0 && bboxesOverlap(p, q, r, s)) return true;
+                if ((d3 === 0 && onSegmentPool(p, q, r)) || (d4 === 0 && onSegmentPool(p, q, s)) ||
+                    (d1 === 0 && onSegmentPool(r, s, p)) || (d2 === 0 && onSegmentPool(r, s, q))) return true;
+            }
+        }
+        return false;
+    }
+    for (let pass = 0; pass < rings.length; pass++) {
+        let dropped = false;
+        for (let i = 0; i < rings.length && !dropped; i++) {
+            for (let j = i + 1; j < rings.length; j++) {
+                if (ringsOverlap(rings[i], rings[j])) {
+                    // drop the smaller ring; ties prefer the later (hole-side) one
+                    const victim = Math.abs(rings[i].area) <= Math.abs(rings[j].area) ? i : j;
+                    const ring = rings[victim];
+                    errors.push({
+                        code: 'overlapping-rings',
+                        ring: ring.source,
+                        message: `ring ${ring.source} overlaps another ring's boundary and was rejected`
+                    });
+                    rings.splice(victim, 1);
+                    stats.droppedRings++;
+                    dropped = true;
+                    break;
+                }
+            }
+        }
+        if (!dropped) break;
+    }
+
+    // ray-casting point-in-ring. After the overlap pass no two surviving ring boundaries cross or
+    // touch (except at shared vertices), so one representative vertex of `inner` is enough to decide
+    // containment — a boundary hit only happens for lobes meeting at a point, which aren't nested.
+    /** @param {CleanRing} ring @param {number} x @param {number} y @returns {boolean} */
+    function pointInRing(ring, x, y) {
+        let inside = false;
+        const ids = ring.ids;
+        for (let k = 0, j = ids.length - 1; k < ids.length; j = k++) {
+            const px = pool[ids[k]][0], py = pool[ids[k]][1];
+            const qx = pool[ids[j]][0], qy = pool[ids[j]][1];
+            if ((py > y) !== (qy > y) && x < (qx - px) * (y - py) / (qy - py) + px) inside = !inside;
+        }
+        return inside;
+    }
+    /** @param {CleanRing} ring @param {number} id @returns {boolean} */
+    function pointOnRing(ring, id) {
+        const ids = ring.ids;
+        for (let k = 0; k < ids.length; k++) {
+            const a = ids[k], b = ids[(k + 1) % ids.length];
+            if (orient3(a, b, id) === 0 && onSegmentPool(a, b, id)) return true;
+            if (samePoint(a, id)) return true;
+        }
+        return false;
+    }
+    /** @param {CleanRing} outer @param {CleanRing} inner @returns {boolean} */
+    function ringContains(outer, inner) {
+        if (Math.abs(outer.area) <= Math.abs(inner.area)) return false;
+        // containment requires EVERY inner vertex inside the outer ring; a single representative
+        // would misclassify a hole whose boundary crosses the outer ring while one vertex stays in.
+        // Boundary vertices are skipped (rings may legitimately touch) and only decisive inside/
+        // outside verdicts count, so rings meeting at a point still resolve to not-contained.
+        let decisive = 0;
+        for (const id of inner.ids) {
+            if (pointOnRing(outer, id)) continue;
+            decisive++;
+            if (!pointInRing(outer, pool[id][0], pool[id][1])) return false;
+        }
+        return decisive > 0;
+    }
+
+    // build the containment hierarchy: parent = smallest ring strictly containing this one.
+    // Rings produced by splitting the SAME input ring are sibling shells, never a nesting: a
+    // figure-eight's lobes may geometrically overlap in bbox but neither is a hole of the other.
+    /** @param {CleanRing[]} survivors */
+    function buildHierarchy(survivors) {
+        for (const ring of survivors) {
+            /** @type {CleanRing | null} */
+            let parent = null;
+            for (const candidate of survivors) {
+                if (candidate === ring || candidate.source === ring.source ||
+                        !ringContains(candidate, ring)) continue;
+                if (!parent || Math.abs(candidate.area) < Math.abs(parent.area)) parent = candidate;
+            }
+            ring.parent = parent;
+            ring.depth = parent ? parent.depth + 1 : 0;
+        }
+    }
+    buildHierarchy(rings);
+
+    // a declared hole (source > 0) with no containing ring sits outside the outer ring. A split
+    // hole fans out into several rings sharing one source, so report each source ring once.
+    /** @type {Set<number>} */
+    const outsideReported = new Set();
+    /** @param {CleanRing[]} survivors */
+    function dropOutsideHoles(survivors) {
+        for (let k = survivors.length - 1; k >= 0; k--) {
+            const ring = survivors[k];
+            if (ring.depth === 0 && ring.source > 0 && !outsideReported.has(ring.source)) {
+                outsideReported.add(ring.source);
+                errors.push({
+                    code: 'hole-outside',
+                    ring: ring.source,
+                    message: `hole ring ${ring.source} is not inside the outer ring and was rejected`
+                });
+                stats.droppedRings++;
+                survivors.splice(k, 1);
+            }
+        }
+    }
+    dropOutsideHoles(rings);
+    buildHierarchy(rings);
+
+    // depth parity: even = filled shell, odd = hole. An island (even depth >= 2) nested in a hole
+    // becomes its own polygon, so holes never cover the outer ring; record the nesting explicitly.
+    // Split siblings share a source, so the nested-ring notice is likewise emitted once per source.
+    /** @type {Set<number>} */
+    const nestedReported = new Set();
+    for (const ring of rings) {
+        if (ring.depth >= 2 && !nestedReported.has(ring.source)) {
+            nestedReported.add(ring.source);
+            const tail = ring.depth % 2 === 0 ?
+                'and was emitted as a separate island polygon' :
+                'and was attached as a hole of its island';
+            errors.push({
+                code: 'nested-ring',
+                ring: ring.source,
+                message: `ring ${ring.source} is nested ${ring.depth} levels deep ${tail}`
+            });
+        }
+    }
+
+    // group rings into output polygons: each even-depth shell owns itself plus the odd-depth holes
+    // whose nearest even ancestor it is; the outer shell and every island are separate polygons
+
+    // final safety gate: a ring that survived every earlier pass must actually be simple. Sibling
+    // lobes split from the same source ring can overlap each other, and the overlap-rejection pass
+    // only handles ring pairs — so re-check each ring against itself and reject any that still
+    // crosses. Emitting a self-intersecting shell would make earcut() produce wrong triangles,
+    // which is exactly the failure repair() exists to prevent.
+    /** @param {CleanRing} ring @returns {boolean} */
+    function isSimpleRing(ring) {
+        const ids = ring.ids, n = ids.length;
+        for (let i = 0; i < n; i++) {
+            const a = ids[i], b = ids[(i + 1) % n];
+            for (let j = i + 2; j < n; j++) {
+                if (i === 0 && j === n - 1) continue; // adjacent circular edges
+                const c = ids[j], d = ids[(j + 1) % n];
+                const d1 = orient3(c, d, a), d2 = orient3(c, d, b);
+                const d3 = orient3(a, b, c), d4 = orient3(a, b, d);
+                if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+                    ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return false;
+                // collinear overlap (shared endpoints are allowed), or a T-junction in the interior
+                if (d1 === 0 && d2 === 0 && d3 === 0 && d4 === 0 && bboxesOverlap(a, b, c, d) &&
+                        !samePoint(a, c) && !samePoint(a, d) && !samePoint(b, c) && !samePoint(b, d)) {
+                    return false;
+                }
+                if ((d3 === 0 && onSegmentPool(a, b, c)) || (d4 === 0 && onSegmentPool(a, b, d)) ||
+                        (d1 === 0 && onSegmentPool(c, d, a)) || (d2 === 0 && onSegmentPool(c, d, b))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    // do the boundaries of two distinct rings cross or overlap (a shared vertex is allowed)?
+    /** @param {CleanRing} shell @param {CleanRing} hole @returns {boolean} */
+    function ringsCross(shell, hole) {
+        const ai = shell.ids, bi = hole.ids;
+        for (let i = 0; i < ai.length; i++) {
+            const a = ai[i], b = ai[(i + 1) % ai.length];
+            for (let j = 0; j < bi.length; j++) {
+                const c = bi[j], d = bi[(j + 1) % bi.length];
+                if (samePoint(a, c) || samePoint(a, d) || samePoint(b, c) || samePoint(b, d)) continue;
+                const d1 = orient3(c, d, a), d2 = orient3(c, d, b);
+                const d3 = orient3(a, b, c), d4 = orient3(a, b, d);
+                if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+                    ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+                if (d1 === 0 && d2 === 0 && d3 === 0 && d4 === 0 && bboxesOverlap(a, b, c, d)) return true;
+                if ((d3 === 0 && onSegmentPool(a, b, c)) || (d4 === 0 && onSegmentPool(a, b, d)) ||
+                        (d1 === 0 && onSegmentPool(c, d, a)) || (d2 === 0 && onSegmentPool(c, d, b))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    /** @type {Set<number>} */
+    const nonsimpleReported = new Set();
+    for (let k = rings.length - 1; k >= 0; k--) {
+        if (!isSimpleRing(rings[k])) {
+            const ring = rings[k];
+            if (!nonsimpleReported.has(ring.source)) {
+                nonsimpleReported.add(ring.source);
+                errors.push({
+                    code: 'self-intersection',
+                    ring: ring.source,
+                    message: `ring ${ring.source} could not be decomposed into simple rings and was rejected`
+                });
+            }
+            rings.splice(k, 1);
+            stats.droppedRings++;
+        }
+    }
+    // dropping a shell orphans the holes nested in it; rebuild the hierarchy and re-run the
+    // outside-hole sweep, since an orphaned declared hole must not be emitted as a root shell
+    buildHierarchy(rings);
+    dropOutsideHoles(rings);
+    buildHierarchy(rings);
+
+    /** @type {Map<CleanRing, CleanRing[]>} */
+    const byOwner = new Map();
+    for (const ring of rings) {
+        if (ring.depth % 2 === 0) {
+            byOwner.set(ring, [ring]);
+        } else {
+            /** @type {CleanRing} */
+            let owner = ring;
+            while (owner.depth % 2 !== 0) {
+                owner = /** @type {CleanRing} */ (owner.parent);
+            }
+            const group = byOwner.get(owner);
+            if (group) group.push(ring);
+        }
+    }
+
+    /** @type {RepairedPolygon[]} */
+    const polygons = [];
+    /** @type {Set<number>} */
+    const crossingReported = new Set();
+    // emit outer-ring-derived polygons first, islands after; within a polygon, shell then holes
+    const owners = [...byOwner.keys()].sort((a, b) => a.source - b.source || Math.abs(b.area) - Math.abs(a.area));
+    for (const owner of owners) {
+        const group = byOwner.get(owner);
+        if (!group) continue;
+        const shell = group[0];
+        // a hole whose boundary crosses its shell (or a sibling hole) cannot be triangulated as a
+        // hole; reject it and emit the shell without it rather than produce overlapping triangles
+        const holes = group.slice(1).sort((a, b) => a.source - b.source).filter((hole) => {
+            let crosses = ringsCross(shell, hole);
+            if (!crosses) {
+                for (const other of group) {
+                    if (other !== shell && other !== hole && ringsCross(other, hole)) { crosses = true; break; }
+                }
+            }
+            if (crosses) {
+                stats.droppedRings++;
+                if (!crossingReported.has(hole.source)) {
+                    crossingReported.add(hole.source);
+                    errors.push({
+                        code: 'overlapping-rings',
+                        ring: hole.source,
+                        message: `hole ring ${hole.source} crosses another ring's boundary and was rejected`
+                    });
+                }
+            }
+            return !crosses;
+        });
+        /** @type {number[]} */
+        const vertices = [];
+        /** @type {number[]} */
+        const holesOut = [];
+        /** @type {number[]} */
+        const sourceRings = [];
+        for (const ring of [shell, ...holes]) {
+            if (ring !== shell) holesOut.push(vertices.length / dim);
+            sourceRings.push(ring.source);
+            for (const id of ring.ids) vertices.push(...pool[id]);
+        }
+        polygons.push({vertices, holes: holesOut, dimensions: dim, sourceRings});
+    }
+
+    return {polygons, errors, stats};
+}
+
+/**
+ * @typedef {object} TriangleValidationStats
+ * @property {number} droppedDegenerate zero-area triangles removed
+ * @property {number} droppedInvalid triangles with out-of-range or non-integer indices removed
+ */
+
+/**
+ * @typedef {object} TriangleValidationResult
+ * @property {number[]} triangles the surviving triplets, ready for a vertex buffer
+ * @property {RepairError[]} errors one entry per invalid triplet (degenerate drops are not errors)
+ * @property {TriangleValidationStats} stats
+ */
+
+/**
+ * Validate an earcut() index buffer against its vertex data: every index must be an integer in
+ * `[0, vertexCount)`, the buffer length must be a multiple of three, and zero-area (degenerate)
+ * triangles are removed. Returns a new array — the input is never mutated. Degenerate triangles
+ * are counted in `stats` rather than reported as errors: after repairing dirty input their absence
+ * is expected, whereas an out-of-range index would feed the GPU garbage and is always an error.
+ *
+ * @param {ArrayLike<number>} triangles triangle indices, as returned by earcut()
+ * @param {ArrayLike<number>} data flat coordinate array the indices refer into
+ * @param {number} [dim=2] number of coordinates per vertex in `data`
+ * @returns {TriangleValidationResult}
+ */
+export function validateTriangles(triangles, data, dim = 2) {
+    if (!Number.isInteger(dim) || dim < 2 || data.length % dim !== 0) {
+        throw new RangeError('validateTriangles: data length is not a multiple of dim');
+    }
+    const vertexCount = data.length / dim;
+    /** @type {number[]} */
+    const kept = [];
+    /** @type {RepairError[]} */
+    const errors = [];
+    let droppedDegenerate = 0;
+    let droppedInvalid = 0;
+
+    if (triangles.length % 3 !== 0) {
+        errors.push({
+            code: 'degenerate-ring',
+            message: `triangle list length ${triangles.length} is not a multiple of 3; trailing indices ignored`
+        });
+    }
+
+    const triplets = Math.floor(triangles.length / 3);
+    for (let t = 0; t < triplets; t++) {
+        const k = t * 3;
+        const a = triangles[k], b = triangles[k + 1], c = triangles[k + 2];
+        const valid = Number.isInteger(a) && Number.isInteger(b) && Number.isInteger(c) &&
+            a >= 0 && b >= 0 && c >= 0 && a < vertexCount && b < vertexCount && c < vertexCount;
+
+        if (!valid) {
+            errors.push({
+                code: 'overlapping-rings',
+                message: `triangle ${t} has an index outside [0, ${vertexCount - 1}]: [${a}, ${b}, ${c}]`
+            });
+            droppedInvalid++;
+            continue;
+        }
+
+        const ax = data[a * dim], ay = data[a * dim + 1];
+        const bx = data[b * dim], by = data[b * dim + 1];
+        const cx = data[c * dim], cy = data[c * dim + 1];
+        if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) {
+            droppedDegenerate++;
+            continue;
+        }
+        kept.push(a, b, c);
+    }
+
+    return {
+        triangles: kept,
+        errors,
+        stats: {droppedDegenerate, droppedInvalid}
+    };
+}
+
+// expose repair() as earcut.repair while keeping the default-export function signature untouched
+earcut.repair = repair;
