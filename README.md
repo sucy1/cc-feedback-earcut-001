@@ -50,7 +50,9 @@ for speed, aiming to always produce an acceptable result on practical data witho
 emitting garbage. The input is assumed to be a valid polygon: rings that don't self-cross or
 overlap, holes that stay inside the outer ring, and no duplicate or zero-length edges. On input
 that breaks these assumptions, the result can be noticeably wrong — overlapping triangles, gaps,
-or triangles outside the polygon. If correctness matters, clean your input first; for a
+or triangles outside the polygon. Two options cover this: run the opt-in
+[`earcut.repair`](#earcutrepairvertices-holes-dimensions--2-options) layer to clean and validate
+the input first (it rejects or decomposes the bad cases instead of guessing), or, for a
 guaranteed-correct triangulation even on bad data, see
 [libtess.js](https://github.com/brendankenny/libtess.js) (slower and larger).
 
@@ -63,7 +65,7 @@ conforming mesh, [remove T-junctions in a post-process](https://github.com/mapbo
 Install with NPM: `npm install earcut`, then import as a module:
 
 ```js
-import earcut, {flatten, deviation, refine} from 'earcut';
+import earcut, {flatten, deviation, refine, repair} from 'earcut';
 ```
 
 Or use as a module directly in the browser with [jsDelivr](https://www.jsdelivr.com/esm):
@@ -104,6 +106,54 @@ earcut([10,0,1, 0,50,2, 60,60,3, 70,10,4], null, 3);
 If you pass a single vertex as a hole, Earcut treats it as a Steiner point.
 
 Output triangles always have a consistent **winding order** regardless of the input polygon's winding &mdash; counter-clockwise in a y-up coordinate system (clockwise in y-down/screen space). If you need the opposite orientation (e.g. for back-face culling or normals in 3D), call `.reverse()` on the result.
+
+The returned indices always address a vertex of the input, and any zero-area (collinear or
+repeated-vertex) triangle is filtered out, so the output never contains an out-of-range index or
+a degenerate triangle.
+
+### `earcut.repair(vertices[, holes, dimensions = 2, options])`
+
+Dirty input &mdash; repeated points, self-crossing rings, or holes that aren't properly inside
+their outer ring &mdash; can make a plain `earcut` call produce a wrong mesh. The opt-in
+`repair` layer validates and cleans that input *before* triangulation, leaving the fast
+`earcut(data, holes, dim)` path unchanged. It returns the repaired polygons plus a list of every
+problem found; it never throws on geometric dirtiness.
+
+```js
+import earcut from 'earcut';
+
+const {polygons, errors} = earcut.repair(vertices, holes, dimensions);
+if (errors.length) {
+    // the caller decides: log, drop the feature, surface it to the user …
+    console.warn(errors.map(e => e.message));
+}
+const triangles = [];
+for (const poly of polygons) {
+    triangles.push(...earcut(poly.vertices, poly.holes, poly.dimensions));
+}
+```
+
+`repair` performs, in order:
+
+1. **Ring cleaning** &mdash; removes consecutive and closing duplicate points and interior
+   collinear points (using a floating-point tolerance, so intersections split on two edges that
+   differ only by roundoff still merge). Rings that collapse to fewer than three points, or
+   contain non-finite coordinates, are dropped with an error.
+2. **Self-intersection handling** &mdash; by default (`onSelfIntersect: 'error'`, the implicit
+   option) a self-crossing ring is reported and dropped, so it can never silently yield wrong
+   triangles. Pass `onSelfIntersect: 'split'` to instead cut the ring at its crossings into a
+   set of simple rings. Ambiguous overlaps (collinear edges doubling back over each other)
+   cannot be split unambiguously and are always reported.
+3. **Hole validation** &mdash; every hole must lie inside its outer ring. A hole outside the
+   outer ring is reported and emitted as its own polygon. Nested rings are handled by depth:
+   an even-depth ring is a polygon outer ring, an odd-depth ring is its hole, and an island
+   inside a hole opens a separate polygon &mdash; so a hole can never cover an outer ring.
+
+Each element of `polygons` is `{vertices, holes, dimensions}`, the same shape `earcut` takes,
+and every repaired polygon triangulates with [zero `deviation`](#deviationvertices-holes-dimensions-triangles).
+The `errors` entries are `{code, message, ringIndex?, holeIndex?}` with stable `code` values:
+`invalid-argument`, `non-finite-coordinate`, `degenerate-ring`, `self-intersection`,
+`hole-outside`, `nested-hole`, and `invalid-hole-index`.
 
 ### `refine(triangles, vertices[, dimensions = 2])`
 

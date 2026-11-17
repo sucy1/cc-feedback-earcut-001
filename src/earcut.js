@@ -14,6 +14,8 @@
  * @property {Node | null} nextZ next node in z-order
  */
 
+import repair from './repair.js';
+
 // single-vertex holes to preserve through filterPoints (steiner points); kept off the Node
 // shape since they're rare — the empty-set fast path means non-steiner inputs pay nothing
 /** @type {Set<Node>} */
@@ -37,7 +39,7 @@ let filteredOut = false;
  * @returns {number[]} triangles as triplets of vertex indices into `data`
  * @example earcut([10,0, 0,50, 60,60, 70,10]); // [1,0,3, 3,2,1]
  */
-export default function earcut(data, holeIndices, dim = 2) {
+function earcut(data, holeIndices, dim = 2) {
 
     const hasHoles = holeIndices && holeIndices.length;
     const outerLen = hasHoles ? holeIndices[0] * dim : data.length;
@@ -77,7 +79,65 @@ export default function earcut(data, holeIndices, dim = 2) {
     earcutLinked(outerNode, triangles, minX, minY, invSize);
     while (splitStack.length) earcutLinked(/** @type {Node} */ (splitStack.pop()), triangles, minX, minY, invSize);
 
+    return sanitizeTriangles(triangles, data, dim);
+}
+
+// Output contract guard: every index must address a real vertex, and a zero-area triplet is a
+// degenerate triangle that would render as nothing while still consuming indices. On well-formed
+// input earcut never emits either, so this is a defensive backstop for dirty data rather than a
+// normal path. The clean fast path is one forward scan with no writes; only when a triangle is
+// rejected do we fall back to in-place compaction, so well-formed output pays no allocation and
+// no array truncation.
+/**
+ * @param {number[]} triangles
+ * @param {ArrayLike<number>} data
+ * @param {number} dim
+ * @returns {number[]}
+ */
+function sanitizeTriangles(triangles, data, dim) {
+    const vertexCount = data.length / dim;
+    /**
+     * @param {number} i
+     * @returns {boolean}
+     */
+    const badTriangleAt = (i) => {
+        const a = triangles[i], b = triangles[i + 1], c = triangles[i + 2];
+        // range first: an out-of-range index must never reach the coordinate reads below
+        if (a < 0 || b < 0 || c < 0 || a >= vertexCount || b >= vertexCount || c >= vertexCount) return true;
+        return isDegenerate(data, dim, a, b, c);
+    };
+
+    let firstBad = -1;
+    for (let i = 0; i < triangles.length; i += 3) {
+        if (badTriangleAt(i)) { firstBad = i; break; }
+    }
+    if (firstBad === -1) return triangles; // common case: output already satisfies the contract
+
+    let write = firstBad;
+    for (let i = firstBad; i < triangles.length; i += 3) {
+        if (badTriangleAt(i)) continue;
+        triangles[write++] = triangles[i];
+        triangles[write++] = triangles[i + 1];
+        triangles[write++] = triangles[i + 2];
+    }
+    triangles.length = write;
     return triangles;
+}
+
+/**
+ * A triangle is degenerate when its doubled area is exactly zero (collinear or repeated
+ * vertices). Near-zero-but-real slivers are kept: they are legitimate triangles, and the
+ * repair layer's epsilon snapping already merges vertices that only differ by FP roundoff,
+ * so genuinely spurious split slivers never reach this point.
+ *
+ * @param {ArrayLike<number>} data @param {number} dim
+ * @param {number} a @param {number} b @param {number} c @returns {boolean}
+ */
+function isDegenerate(data, dim, a, b, c) {
+    const ax = data[a * dim], ay = data[a * dim + 1];
+    const bx = data[b * dim], by = data[b * dim + 1];
+    const cx = data[c * dim], cy = data[c * dim + 1];
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0;
 }
 
 // create a circular doubly linked list from polygon points in the specified winding order
@@ -1053,3 +1113,12 @@ function ensureScratch(n) {
     if (!hTable || hTable.length < size) { hTable = new Int32Array(size); hStamp = new Uint32Array(size); }
     hMask = size - 1;
 }
+
+// Opt-in repair layer for dirty input (duplicate/collinear points, self-intersecting rings,
+// mis-nested holes). Kept as a property on the default export so the classic
+// `earcut(data, holes, dim)` call signature and best-effort behavior are unchanged; callers who
+// need guarantees run earcut.repair(...) first and decide what to do with the reported errors.
+earcut.repair = repair;
+
+export default earcut;
+export {repair};

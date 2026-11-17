@@ -10,6 +10,8 @@
   "files": [
     "src/earcut.js",
     "src/earcut.d.ts",
+    "src/repair.js",
+    "src/repair.d.ts",
     "dist/earcut.min.js",
     "dist/earcut.dev.js"
   ],
