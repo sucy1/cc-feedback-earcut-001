@@ -1,3 +1,5 @@
+import {cleanPolygon} from './repair.js';
+
 /**
  * A vertex in a circular doubly linked list representing a polygon ring.
  * `prev`/`next` are always linked (set immediately after {@link createNode}), so they're typed
@@ -79,6 +81,64 @@ export default function earcut(data, holeIndices, dim = 2) {
 
     return triangles;
 }
+
+/**
+ * Repair dirty polygon input and triangulate it. Unlike {@link earcut}, which assumes valid
+ * input, this first cleans and validates the data (see {@link cleanPolygon} for the full
+ * pipeline: duplicate/collinear/closing points, self-intersecting rings, invalid or nested
+ * holes), triangulates each resulting polygon, and validates the output — out-of-range
+ * indices and zero-area degenerate triangles are dropped.
+ *
+ * Because vertices are removed (and, when splitting self-intersections, inserted), the
+ * returned `data` is a NEW vertex array — use it, not the original input, as the vertex
+ * buffer for `triangles`. For already-clean input, `data` is a copy of the input and
+ * `triangles` matches `earcut` output.
+ *
+ * @param {ArrayLike<number>} data flat array of vertex coordinates
+ * @param {ArrayLike<number> | null} [holeIndices] indices (in vertices, not coordinates) where each hole ring starts
+ * @param {number} [dim=2] number of coordinates per vertex in `data`
+ * @param {object} [options]
+ * @param {'error' | 'split'} [options.selfIntersection='error'] how to handle self-intersecting
+ * rings: 'error' rejects the ring (recorded in `errors`, no triangles for it); 'split' splits
+ * it into simple rings at the crossing points, inserting new vertices
+ * @returns {{data: number[], triangles: number[], errors: string[]}} the cleaned vertices,
+ * triangle indices into them, and every problem found (empty when the input was clean)
+ * @example const {data, triangles, errors} = repair([0,0, 100,0, 100,100, 0,100, 0,0]);
+ */
+function repair(data, holeIndices, dim = 2, options) {
+    const {polygons, errors} = cleanPolygon(data, holeIndices, dim, options);
+    /** @type {number[]} */
+    const out = [];
+    /** @type {number[]} */
+    const triangles = [];
+
+    for (const p of polygons) {
+        const base = out.length / dim;
+        const tris = earcut(p.data, p.holes.length ? p.holes : null, dim);
+        const numVerts = p.data.length / dim;
+
+        // validate output: only in-range indices and non-degenerate triangles make it out
+        for (let i = 0; i < tris.length; i += 3) {
+            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            if (a < 0 || a >= numVerts || b < 0 || b >= numVerts || c < 0 || c >= numVerts) {
+                errors.push('earcut returned an out-of-range vertex index; triangle dropped');
+                continue;
+            }
+            const ai = a * dim, bi = b * dim, ci = c * dim;
+            if ((p.data[bi] - p.data[ai]) * (p.data[ci + 1] - p.data[ai + 1]) ===
+                (p.data[bi + 1] - p.data[ai + 1]) * (p.data[ci] - p.data[ai])) continue; // zero-area
+            triangles.push(base + a, base + b, base + c);
+        }
+
+        out.push(...p.data);
+    }
+
+    return {data: out, triangles, errors};
+}
+
+// exposed both as a named export and as `earcut.repair`, so both import styles work
+export {repair};
+earcut.repair = repair;
 
 // create a circular doubly linked list from polygon points in the specified winding order
 /** @param {ArrayLike<number>} data @param {number} start @param {number} end @param {number} dim @param {boolean} clockwise @returns {Node | null} */

@@ -50,7 +50,8 @@ for speed, aiming to always produce an acceptable result on practical data witho
 emitting garbage. The input is assumed to be a valid polygon: rings that don't self-cross or
 overlap, holes that stay inside the outer ring, and no duplicate or zero-length edges. On input
 that breaks these assumptions, the result can be noticeably wrong — overlapping triangles, gaps,
-or triangles outside the polygon. If correctness matters, clean your input first; for a
+or triangles outside the polygon. If correctness matters, clean your input first (see
+[`repair`](#repairvertices-holes-dimensions--2-options) below); for a
 guaranteed-correct triangulation even on bad data, see
 [libtess.js](https://github.com/brendankenny/libtess.js) (slower and larger).
 
@@ -104,6 +105,22 @@ earcut([10,0,1, 0,50,2, 60,60,3, 70,10,4], null, 3);
 If you pass a single vertex as a hole, Earcut treats it as a Steiner point.
 
 Output triangles always have a consistent **winding order** regardless of the input polygon's winding &mdash; counter-clockwise in a y-up coordinate system (clockwise in y-down/screen space). If you need the opposite orientation (e.g. for back-face culling or normals in 3D), call `.reverse()` on the result.
+
+### `repair(vertices[, holes, dimensions = 2, options])`
+
+A cleaning-and-validation wrapper around `earcut` for dirty input (also available as `earcut.repair`). It removes duplicate, collinear and duplicated closing points, rejects or splits self-intersecting rings, validates holes (each must lie inside the outer ring; a hole inside a hole is treated as a solid island), and validates the output (in-range indices, no zero-area triangles).
+
+```js
+const {data, triangles, errors} = repair(dirtyVertices, dirtyHoles);
+// render `data` as the vertex buffer with `triangles` as the index buffer;
+// `errors` lists every problem found (empty when the input was clean)
+```
+
+Because vertices are removed (and possibly inserted), the returned `data` is a **new** vertex array &mdash; index it with the returned `triangles`, not your original buffer. Options:
+
+* `selfIntersection`: `'error'` (default) rejects a self-intersecting ring (recorded in `errors`, no triangles for it); `'split'` splits it into simple rings at the crossing points.
+
+For already-clean input, `repair` returns a copy of the input and the same triangles as `earcut`, so you can use it unconditionally when input quality is uncertain. It's slower than plain `earcut` (the validation passes are quadratic in ring size), so hot paths with trusted data should still call `earcut` directly.
 
 ### `refine(triangles, vertices[, dimensions = 2])`
 

@@ -9,6 +9,7 @@
   "types": "src/earcut.d.ts",
   "files": [
     "src/earcut.js",
+    "src/repair.js",
     "src/earcut.d.ts",
     "dist/earcut.min.js",
     "dist/earcut.dev.js"
